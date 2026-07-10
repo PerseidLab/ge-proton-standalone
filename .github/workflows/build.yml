@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Dependencies
         run: |
@@ -26,7 +26,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Get the latest release tag from GloriousEggroll
+          # Get the latest release tag from GloriousEggroll
           GE_RELEASE_JSON=$(gh api repos/GloriousEggroll/proton-ge-custom/releases/latest)
           GE_VERSION=$(echo "$GE_RELEASE_JSON" | jq -r '.tag_name')
 
@@ -36,7 +36,7 @@ jobs:
             exit 0
           fi
 
-          # 2. Check if this specific tag already exists in YOUR repository
+          # Check if this specific tag already exists in YOUR repository
           # We check the git ref directly; if it returns 404, the tag is new to us.
           if gh api repos/${{ github.repository }}/git/ref/tags/$GE_VERSION --silent > /dev/null 2>&1; then
             echo "Tag $GE_VERSION already exists in this repo. Skipping build."
@@ -47,7 +47,7 @@ jobs:
             echo "GE_VERSION=$GE_VERSION" >> $GITHUB_ENV
             
             # Extract the download URL for the .tar.gz asset from the GE release
-            DOWNLOAD_URL=$(echo "$GE_RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url')
+            DOWNLOAD_URL=$(echo "$GE_RELEASE_JSON" | jq -r '.assets[] | select((.name | endswith(".tar.gz")) and (.name | contains("aarch64") | not)) | .browser_download_url')
             echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
             echo "FINAL_NAME=${GE_VERSION}-standalone.AppImage" >> $GITHUB_ENV
           fi
@@ -56,7 +56,9 @@ jobs:
         if: steps.check_version.outputs.skip != 'true'
         run: |
           mkdir -p AppDir/opt/GE-Proton
-          wget -qO- "${{ env.DOWNLOAD_URL }}" | tar -xz -C AppDir/opt/GE-Proton --strip-components=1
+          wget -qO archive.tar "${{ env.DOWNLOAD_URL }}"
+          tar -xf archive.tar -C AppDir/opt/GE-Proton --strip-components=1
+          rm archive.tar
 
       - name: Build AppImage
         if: steps.check_version.outputs.skip != 'true'
