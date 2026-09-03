@@ -1,197 +1,98 @@
-name: Build GE-Proton AppImage (ARM64)
+steps:
+  - name: Checkout
+    uses: actions/checkout@v5
 
-on:
-  workflow_dispatch:
-    inputs:
-      ge_version:
-        description: 'Version Name (e.g., GE-Proton9-23)'
-        required: true
-        default: 'GE-Proton-Custom'
-      download_url:
-        description: 'Direct link to the GE-Proton .tar.gz file'
-        required: true
-      box64_url:
-        description: 'Optional direct URL to a box64 (aarch64) release asset (deb, tar.gz, or raw binary). If empty the workflow will auto-detect the latest box64 release for arm64 from GitHub.'
-        required: false
-        default: ''
+  - name: Enable aarch64 emulation (QEMU binfmt)
+    uses: docker/setup-qemu-action@v2
 
-permissions:
-  contents: write
+  - name: Install host deps
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libfuse2 jq tar wget dpkg ar xz-utils file
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      FINAL_NAME: ${{ github.event.inputs.ge_version }}-standalone.AppImage
-      APPIMAGETOOL_URL: https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
+  - name: Set environment variables
+    run: |
+      echo "GE_VERSION=${{ github.event.inputs.ge_version }}" >> $GITHUB_ENV
+      echo "DOWNLOAD_URL=${{ github.event.inputs.download_url }}" >> $GITHUB_ENV
+      echo "BOX64_URL_INPUT=${{ github.event.inputs.box64_url }}" >> $GITHUB_ENV
+      echo "FINAL_NAME=${{ env.FINAL_NAME }}" >> $GITHUB_ENV
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+  - name: Prepare AppDir and extract GE-Proton payload
+    run: |
+      set -eu
+      rm -rf AppDir
+      mkdir -p AppDir/opt/GE-Proton AppDir/usr/bin AppDir/usr/lib
+      # Fetch GE tarball and extract into AppDir/opt/GE-Proton
+      wget -qO archive.tar "${{ env.DOWNLOAD_URL }}"
+      tar -xf archive.tar -C AppDir/opt/GE-Proton --strip-components=1
+      rm archive.tar
 
-      - name: Enable aarch64 emulation (QEMU binfmt)
-        uses: docker/setup-qemu-action@v2
+  - name: Discover and install box64 (aarch64) into AppDir
+    run: |
+      set -eu
+      cd "$GITHUB_WORKSPACE"
+      BOX64_URL="${BOX64_URL_INPUT:-}"
+      if [ -z "$BOX64_URL" ]; then
+        echo "No BOX64_URL provided; querying GitHub releases for ptitSeb/box64..."
+        release_json=$(curl -s https://api.github.com/repos/ptitSeb/box64/releases/latest)
+        BOX64_URL=$(echo "$release_json" \
+          | jq -r '.assets[].browser_download_url' \
+          | egrep -i 'arm64|aarch64|armv8|aarch64|linux_arm64|arm64.deb|arm64.tar.gz|arm64.tgz|linux-aarch64|aarch64.deb' \
+          | head -n1 || true)
+        if [ -z "$BOX64_URL" ]; then
+          BOX64_URL=$(echo "$release_json" \
+            | jq -r '.assets[].browser_download_url' \
+            | egrep -i '\.deb$|\.tar.gz$|\.tgz$|box64' \
+            | head -n1 || true)
+        fi
+        if [ -z "$BOX64_URL" ]; then
+          echo "Could not auto-detect a box64 release asset for arm64. Provide box64_url input to the workflow." >&2
+          exit 1
+        fi
+        echo "Auto-detected BOX64 URL: $BOX64_URL"
+      else
+        echo "Using user-provided BOX64 URL: $BOX64_URL"
+      fi
 
-      - name: Install host deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse2 jq tar wget dpkg ar xz-utils file
+      TMP=box64_tmp
+      mkdir -p "$TMP"
+      wget -qO "$TMP/box64_asset" "$BOX64_URL"
 
-      - name: Set environment variables
-        run: |
-          echo "GE_VERSION=${{ github.event.inputs.ge_version }}" >> $GITHUB_ENV
-          echo "DOWNLOAD_URL=${{ github.event.inputs.download_url }}" >> $GITHUB_ENV
-          echo "BOX64_URL_INPUT=${{ github.event.inputs.box64_url }}" >> $GITHUB_ENV
-          echo "FINAL_NAME=${{ env.FINAL_NAME }}" >> $GITHUB_ENV
+      FILETYPE=$(file -b "$TMP/box64_asset" || true)
+      echo "Downloaded asset file type: $FILETYPE"
 
-      - name: Prepare AppDir and extract GE-Proton payload
-        run: |
-          set -eu
-          rm -rf AppDir
-          mkdir -p AppDir/opt/GE-Proton AppDir/usr/bin AppDir/usr/lib
-          # Fetch GE tarball and extract into AppDir/opt/GE-Proton
-          wget -qO archive.tar "${{ env.DOWNLOAD_URL }}"
-          tar -xf archive.tar -C AppDir/opt/GE-Proton --strip-components=1
-          rm archive.tar
+      if file "$TMP/box64_asset" | grep -qi 'Debian binary package'; then
+        echo "Detected .deb package; extracting..."
+        mkdir -p "$TMP/deb"
+        dpkg-deb -x "$TMP/box64_asset" "$TMP/deb"
+        if [ -x "$TMP/deb/usr/bin/box64" ]; then
+          install -Dm755 "$TMP/deb/usr/bin/box64" AppDir/usr/bin/box64
+        else
+          find "$TMP/deb" -type f -name 'box64' -executable -exec install -Dm755 {} AppDir/usr/bin/box64 \; -quit || true
+        fi
+      elif echo "$FILETYPE" | grep -qi 'gzip compressed data'; then
+        echo "Detected tarball; extracting..."
+        mkdir -p "$TMP/tar"
+        tar -xzf "$TMP/box64_asset" -C "$TMP/tar" || tar -xJf "$TMP/box64_asset" -C "$TMP/tar" || true
+        find "$TMP/tar" -type f -name 'box64' -executable -exec install -Dm755 {} AppDir/usr/bin/box64 \; -quit || true
+      elif echo "$FILETYPE" | grep -qi 'ELF 64-bit LSB shared object' || echo "$FILETYPE" | grep -qi 'ELF 64-bit LSB executable'; then
+        echo "Detected an ELF binary; installing as box64"
+        install -Dm755 "$TMP/box64_asset" AppDir/usr/bin/box64
+      else
+        echo "Unknown asset type; attempting to treat it as raw binary"
+        install -Dm755 "$TMP/box64_asset" AppDir/usr/bin/box64 || true
+      fi
 
-      - name: Discover and install box64 (aarch64) into AppDir
-        run: |
-          set -eu
-          cd "$GITHUB_WORKSPACE"
-          BOX64_URL="${BOX64_URL_INPUT:-}"
-          if [ -z "$BOX64_URL" ]; then
-            echo "No BOX64_URL provided; querying GitHub releases for ptitSeb/box64..."
-            release_json=$(curl -s https://api.github.com/repos/ptitSeb/box64/releases/latest)
-            # Try to find an asset that looks like an aarch64/deb/tar/static binary
-            BOX64_URL=$(echo "$release_json" \
-              | jq -r '.assets[].browser_download_url' \
-              | egrep -i 'arm64|aarch64|armv8|aarch64|linux_arm64|arm64.deb|arm64.tar.gz|arm64.tgz|linux-aarch64|aarch64.deb' \
-              | head -n1 || true)
-            if [ -z "$BOX64_URL" ]; then
-              # fallback: try any .deb or tar.gz asset
-              BOX64_URL=$(echo "$release_json" \
-                | jq -r '.assets[].browser_download_url' \
-                | egrep -i '\.deb$|\.tar.gz$|\.tgz$|box64' \
-                | head -n1 || true)
-            fi
-            if [ -z "$BOX64_URL" ]; then
-              echo "Could not auto-detect a box64 release asset for arm64. Provide box64_url input to the workflow." >&2
-              exit 1
-            fi
-            echo "Auto-detected BOX64 URL: $BOX64_URL"
-          else
-            echo "Using user-provided BOX64 URL: $BOX64_URL"
-          fi
+      if [ ! -x AppDir/usr/bin/box64 ]; then
+        echo "Failed to extract or locate an executable box64 inside the downloaded asset." >&2
+        ls -la "$TMP" || true
+        exit 1
+      fi
 
-          TMP=box64_tmp
-          mkdir -p "$TMP"
-          # Download asset
-          wget -qO "$TMP/box64_asset" "$BOX64_URL"
+      chmod +x AppDir/usr/bin/box64
+      echo "box64 installed to AppDir/usr/bin/box64"
 
-          # Inspect and extract the binary into AppDir/usr/bin/box64
-          FILETYPE=$(file -b "$TMP/box64_asset" || true)
-          echo "Downloaded asset file type: $FILETYPE"
-
-          # If .deb -> extract data.tar.* contents
-          if file "$TMP/box64_asset" | grep -qi 'Debian binary package'; then
-            echo "Detected .deb package; extracting..."
-            mkdir -p "$TMP/deb"
-            dpkg-deb -x "$TMP/box64_asset" "$TMP/deb"
-            # try common locations for the binary
-            if [ -x "$TMP/deb/usr/bin/box64" ]; then
-              install -Dm755 "$TMP/deb/usr/bin/box64" AppDir/usr/bin/box64
-            else
-              # copy any executable named box64
-              find "$TMP/deb" -type f -name 'box64' -executable -exec install -Dm755 {} AppDir/usr/bin/box64 \; -quit || true
-            fi
-          elif echo "$FILETYPE" | grep -qi 'gzip compressed data'; then
-            echo "Detected tarball; extracting..."
-            mkdir -p "$TMP/tar"
-            tar -xzf "$TMP/box64_asset" -C "$TMP/tar" || tar -xJf "$TMP/box64_asset" -C "$TMP/tar" || true
-            # try to locate a binary named box64
-            find "$TMP/tar" -type f -name 'box64' -executable -exec install -Dm755 {} AppDir/usr/bin/box64 \; -quit || true
-          elif echo "$FILETYPE" | grep -qi 'ELF 64-bit LSB shared object' || echo "$FILETYPE" | grep -qi 'ELF 64-bit LSB executable'; then
-            echo "Detected an ELF binary; installing as box64"
-            install -Dm755 "$TMP/box64_asset" AppDir/usr/bin/box64
-          else
-            echo "Unknown asset type; attempting to treat it as raw binary"
-            install -Dm755 "$TMP/box64_asset" AppDir/usr/bin/box64 || true
-          fi
-
-          if [ ! -x AppDir/usr/bin/box64 ]; then
-            echo "Failed to extract or locate an executable box64 inside the downloaded asset." >&2
-            ls -la "$TMP" || true
-            exit 1
-          fi
-
-          # ensure it is executable
-          chmod +x AppDir/usr/bin/box64
-          echo "box64 installed to AppDir/usr/bin/box64"
-
-      - name: Create AppRun wrapper (invokes box64)
-        run: |
-          set -eu
-          cat > AppDir/AppRun <<'EOF'
-#!/bin/sh
-# AppRun wrapper that runs GE-Proton payload via box64 on aarch64 hosts.
-HERE="$(dirname "$(readlink -f "$0")")"
-export PATH="$HERE/usr/bin:$PATH"
-# Prefer library path inside the payload (may need adjusting depending on the GE build)
-export LD_LIBRARY_PATH="$HERE/opt/GE-Proton/lib:$LD_LIBRARY_PATH"
-
-# Allow override of the internal entrypoint in the release (set via environment before running the AppImage)
-if [ -n "$PROTON_ENTRY" ]; then
-  ENTRY="$HERE/opt/GE-Proton/$PROTON_ENTRY"
-else
-  # Try common entrypoints inside GE-Proton
-  for p in "$HERE/opt/GE-Proton/proton" "$HERE/opt/GE-Proton/proton.sh" "$HERE/opt/GE-Proton/bin/wine64" "$HERE/opt/GE-Proton/dist/proton" "$HERE/opt/GE-Proton/run_proton"; do
-    if [ -x "$p" ]; then
-      ENTRY="$p"
-      break
-    fi
-  done
-fi
-
-if [ -z "$ENTRY" ]; then
-  echo "No GE-Proton entrypoint found inside AppDir/opt/GE-Proton. Set PROTON_ENTRY env or adjust AppRun." >&2
-  exit 1
-fi
-
-exec "$HERE/usr/bin/box64" "$ENTRY" "$@"
-EOF
-          chmod +x AppDir/AppRun
-          echo "Wrote AppRun wrapper"
-
-      - name: Download aarch64 appimagetool
-        run: |
-          set -eu
-          wget -qO appimagetool-aarch64.AppImage "${{ env.APPIMAGETOOL_URL }}"
-          chmod +x appimagetool-aarch64.AppImage
-          # sanity: show file info
-          file appimagetool-aarch64.AppImage || true
-
-      - name: Build aarch64 AppImage (run appimagetool-aarch64 under QEMU)
-        run: |
-          set -eux
-          # Run appimagetool (aarch64) under the registered qemu to produce an aarch64 AppImage
-          ARCH=aarch64 ./appimagetool-aarch64.AppImage --appimage-extract-and-run AppDir
-          # Find the generated AppImage (exclude the appimagetool itself)
-          GENERATED_FILE=$(find . -maxdepth 1 -name "*.AppImage" ! -name "appimagetool-*.AppImage" -print -quit)
-          if [ -z "$GENERATED_FILE" ]; then
-            echo "No AppImage produced" >&2
-            ls -la .
-            exit 1
-          fi
-          mv "$GENERATED_FILE" "${{ env.FINAL_NAME }}"
-          ls -lah "${{ env.FINAL_NAME }}"
-
-      - name: Create Release (upload AppImage)
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.GE_VERSION }}
-          name: Release ${{ env.GE_VERSION }} Standalone AppImage (aarch64)
-          files: "${{ env.FINAL_NAME }}"
-          body: "Manual standalone ARM64 (aarch64) build of ${{ env.GE_VERSION }}\n\nSource: ${{ env.DOWNLOAD_URL }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - name: Create AppRun wrapper (invokes box64)
+    run: |
+      set -eu
+      cat > AppDir/AppRun <<'EOF'
